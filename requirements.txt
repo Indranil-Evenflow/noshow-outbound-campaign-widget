@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+numpy
+groq
+python-dotenv
+email-validator
+dnspython
+watchdog
