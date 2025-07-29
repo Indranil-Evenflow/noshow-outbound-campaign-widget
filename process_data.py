@@ -115,16 +115,25 @@ def batch_validate_emails(emails, progress_callback=None):
 
     def validate_single_email(email):
         if not email or pd.isna(email):
+            logger.debug(f"Email {email} is null or NaN, marking as invalid")
             return False
         email_lower = email.lower()
         if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email_lower):
+            logger.debug(f"Email {email} failed regex validation")
             return False
         if any(pattern in email_lower for pattern in CONFIG["dummy_patterns"]):
+            logger.debug(f"Email {email} contains dummy pattern")
             return False
         domain = email_lower.split('@')[-1]
         if domain in CONFIG["suspicious_domains"]:
+            logger.debug(f"Email {email} has suspicious domain")
             return False
-        return validate_email_with_ai(email)
+        # Fallback to True if AI validation fails but regex passes
+        result = validate_email_with_ai(email)
+        if result is False and not any(pattern in email_lower for pattern in CONFIG["dummy_patterns"]) and domain not in CONFIG["suspicious_domains"]:
+            logger.debug(f"Email {email} passed regex but failed AI, allowing as valid")
+            return True
+        return result
 
     total_emails = len(emails)
     for i in range(0, total_emails, CONFIG["email_validation"]["batch_size"]):
@@ -138,12 +147,16 @@ def batch_validate_emails(emails, progress_callback=None):
 
 def clean_phone(phone):
     if pd.isna(phone) or not isinstance(phone, (str, int, float)):
+        logger.debug(f"Phone {phone} is null or invalid type, returning NaN")
         return np.nan
     cleaned = re.sub(r'[^0-9]', '', str(phone))
     if len(cleaned) == 10:
+        logger.debug(f"Phone {phone} cleaned to {cleaned}")
         return f"({cleaned[:3]}) {cleaned[3:6]}-{cleaned[6:]}"
     elif len(cleaned) == 11 and cleaned[0] == '1':
+        logger.debug(f"Phone {phone} cleaned to {cleaned[1:]}")
         return f"({cleaned[1:4]}) {cleaned[4:7]}-{cleaned[7:]}"
+    logger.debug(f"Phone {phone} invalid after cleaning: {cleaned}")
     return np.nan
 
 def load_data_safely(df, required_columns):
@@ -186,7 +199,7 @@ def process_data_pipeline(no_shows_df, planned_next_df, prior_appointments_df, p
     data_files = {
         'no_shows': (no_shows_df, ['service center', 'planned date', 'customer', 'dms_id', 'vin', 'customer email', 'customer phone', 'reporting_status', 'customer_id']),
         'planned_next': (planned_next_df, ['sc_name', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']),
-        'prior_appointments': (prior_appointments_df, ['sc_name', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']),
+        'prior_appointments': (prior_appointments_df, ['dealer', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']),
         'prior_repairs': (prior_repairs_df, ['sc_name', 'open_date', 'vin', 'customer', 'customer phone', 'customer email'])
     }
     
@@ -194,26 +207,39 @@ def process_data_pipeline(no_shows_df, planned_next_df, prior_appointments_df, p
     
     df_no_shows = dfs['no_shows'].copy()
     df_no_shows = df_no_shows[df_no_shows['vin'].notna() & (df_no_shows['vin'] != '')]
+    logger.info(f"After VIN filtering, df_no_shows has {len(df_no_shows)} rows")
+    logger.debug(f"No-show VINs: {df_no_shows['vin'].tolist()}")
     
     exclusion_sources = {
-        'planned_next': 'vin',
-        'prior_appointments': 'vin',
-        'prior_repairs': 'vin'
+        'planned_next': ('vin', 'reporting_status', 'showed'),
+        'prior_appointments': ('vin', 'status', 'showed'),
+        'prior_repairs': ('vin', None, None)  # No status column in prior_repairs
     }
-    for source, col in exclusion_sources.items():
+    for source, (col, status_col, status_value) in exclusion_sources.items():
         if not dfs[source].empty:
-            exclude_vins = dfs[source][col].dropna().unique()
+            if status_col and status_value:
+                # Only exclude VINs where status is 'showed'
+                exclude_vins = dfs[source][dfs[source][status_col].str.lower() == status_value][col].dropna().unique()
+            else:
+                exclude_vins = dfs[source][col].dropna().unique()
+            logger.info(f"Excluding {len(exclude_vins)} VINs from {source}")
+            logger.debug(f"{source} excluded VINs: {exclude_vins.tolist()}")
             df_no_shows = df_no_shows[~df_no_shows['vin'].isin(exclude_vins)]
+    logger.info(f"After exclusion, df_no_shows has {len(df_no_shows)} rows")
     
     df_clean = df_no_shows.sort_values(by=['service center', 'customer'])
+    logger.info(f"df_clean has {len(df_clean)} rows")
     
     logger.info("Validating emails with AI-powered detection...")
     unique_emails = df_clean['customer email'].dropna().unique()
+    logger.info(f"Found {len(unique_emails)} unique emails")
     email_validation_map = batch_validate_emails(unique_emails)
     df_clean['email_valid'] = df_clean['customer email'].map(email_validation_map)
+    logger.info(f"Valid emails: {df_clean['email_valid'].sum()} out of {len(df_clean)}")
     
     logger.info("Cleaning phone numbers...")
     df_clean['phone_clean'] = df_clean['customer phone'].apply(clean_phone)
+    logger.info(f"Valid phone numbers: {df_clean['phone_clean'].notna().sum()} out of {len(df_clean)}")
     
     logger.info("Generating final output lists...")
     
@@ -222,6 +248,7 @@ def process_data_pipeline(no_shows_df, planned_next_df, prior_appointments_df, p
     df_email = df_email[['first_name', 'customer email', 'service center', 'vin']]
     df_email.rename(columns={'customer email': 'email', 'service center': 'sc_name'}, inplace=True)
     df_email = remove_duplicates(df_email, ['vin']).drop(columns=['vin'])
+    logger.info(f"df_email has {len(df_email)} rows")
     
     df_text = df_clean[(df_clean['phone_clean'].notna()) & (df_clean['customer phone'].notna()) & (df_clean['customer phone'] != '')].copy()
     df_text['first_name'] = df_text['customer'].str.split().str[0]
@@ -229,12 +256,14 @@ def process_data_pipeline(no_shows_df, planned_next_df, prior_appointments_df, p
     df_text.rename(columns={'phone_clean': 'phone', 'service center': 'sc_name'}, inplace=True)
     df_text['address_country'] = 'US'
     df_text = remove_duplicates(df_text, ['vin']).drop(columns=['vin'])
+    logger.info(f"df_text has {len(df_text)} rows")
     
     df_target = df_clean[(df_clean['email_valid'] == True) & (df_clean['customer email'].notna()) & (df_clean['customer email'] != '') &
                          (df_clean['phone_clean'].notna()) & (df_clean['customer phone'].notna()) & (df_clean['customer phone'] != '')].copy()
     df_target = df_target[['service center', 'planned date', 'customer', 'dms_id', 'vin', 'customer email', 'customer phone', 'reporting_status', 'customer_id']]
     df_target.rename(columns={'customer email': 'email', 'customer phone': 'phone'}, inplace=True)
     df_target = remove_duplicates(df_target, ['vin'])
+    logger.info(f"df_target has {len(df_target)} rows")
     
     yesterdays_date = get_yesterdays_date()
     current_time = datetime.now().strftime("%H%M%S")
