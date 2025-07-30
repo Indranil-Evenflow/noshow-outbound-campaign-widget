@@ -219,6 +219,6 @@ st.markdown("""
 
 st.markdown("""
     <div class="footer">
-        A EvenFlow AI Tool (Version 1.2) - All rights reserved 2025
+        An EvenFlow AI Tool (Version 1.2) - All rights reserved 2025
     </div>
 """, unsafe_allow_html=True)
