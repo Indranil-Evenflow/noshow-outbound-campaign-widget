@@ -198,11 +198,24 @@ def process_data_pipeline(no_shows_df, planned_next_df, prior_appointments_df, p
     
     data_files = {
         'no_shows': (no_shows_df, ['service center', 'planned date', 'customer', 'dms_id', 'vin', 'customer email', 'customer phone', 'reporting_status', 'customer_id']),
-        'planned_next': (planned_next_df, ['sc_name', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']),
-        'prior_appointments': (prior_appointments_df, ['dealer', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']),
+        'planned_next': (planned_next_df, ['sc_name', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email', 'reporting_status']),
+        'prior_appointments': (prior_appointments_df, ['dealer', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email', 'status']),
         'prior_repairs': (prior_repairs_df, ['sc_name', 'open_date', 'vin', 'customer', 'customer phone', 'customer email'])
     }
     
+    # We need to dynamically find the correct columns from the files
+    # For planned_next, we look for 'reporting_status'.
+    planned_next_cols = ['sc_name', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']
+    if 'reporting_status' in planned_next_df.columns.str.lower():
+        planned_next_cols.append('reporting_status')
+    data_files['planned_next'] = (planned_next_df, planned_next_cols)
+    
+    # For prior_appointments, we look for 'status'.
+    prior_appts_cols = ['dealer', 'planned date', 'dms_id', 'customer', 'vin', 'customer phone', 'customer email']
+    if 'status' in prior_appointments_df.columns.str.lower():
+        prior_appts_cols.append('status')
+    data_files['prior_appointments'] = (prior_appointments_df, prior_appts_cols)
+
     dfs = {name: load_data_safely(df, cols) for name, (df, cols) in data_files.items()}
     
     df_no_shows = dfs['no_shows'].copy()
@@ -210,21 +223,38 @@ def process_data_pipeline(no_shows_df, planned_next_df, prior_appointments_df, p
     logger.info(f"After VIN filtering, df_no_shows has {len(df_no_shows)} rows")
     logger.debug(f"No-show VINs: {df_no_shows['vin'].tolist()}")
     
+    # --- START OF CHANGE ---
+    # The original logic only excluded VINs if their status was 'showed'.
+    # This is updated to exclude VINs for any status indicating they have an active
+    # or rescheduled appointment, or have already shown up.
+    
+    # These are statuses that mean the customer has re-engaged and should be excluded.
+    positive_engagement_statuses = ['active', 'rescheduled', 'showed', 'walk_in_with_appointment']
+    
     exclusion_sources = {
-        'planned_next': ('vin', 'reporting_status', 'showed'),
-        'prior_appointments': ('vin', 'status', 'showed'),
-        'prior_repairs': ('vin', None, None)  # No status column in prior_repairs
+        'planned_next': ('vin', 'reporting_status', positive_engagement_statuses),
+        'prior_appointments': ('vin', 'status', positive_engagement_statuses),
+        'prior_repairs': ('vin', None, None)  # No status column, so any entry is an exclusion
     }
-    for source, (col, status_col, status_value) in exclusion_sources.items():
+
+    for source, (col, status_col, status_values_to_exclude) in exclusion_sources.items():
         if not dfs[source].empty:
-            if status_col and status_value:
-                # Only exclude VINs where status is 'showed'
-                exclude_vins = dfs[source][dfs[source][status_col].str.lower() == status_value][col].dropna().unique()
+            # Check if we need to filter by status
+            if status_col and status_values_to_exclude and status_col in dfs[source].columns:
+                # Exclude VINs where the status is one of the positive engagement types.
+                # .astype(str).str.lower() handles non-string data and ensures case-insensitivity.
+                exclude_vins = dfs[source][
+                    dfs[source][status_col].astype(str).str.lower().isin(status_values_to_exclude)
+                ][col].dropna().unique()
             else:
+                # For prior_repairs or if status column doesn't exist, exclude all VINs.
                 exclude_vins = dfs[source][col].dropna().unique()
+            
             logger.info(f"Excluding {len(exclude_vins)} VINs from {source}")
             logger.debug(f"{source} excluded VINs: {exclude_vins.tolist()}")
             df_no_shows = df_no_shows[~df_no_shows['vin'].isin(exclude_vins)]
+    # --- END OF CHANGE ---
+    
     logger.info(f"After exclusion, df_no_shows has {len(df_no_shows)} rows")
     
     df_clean = df_no_shows.sort_values(by=['service center', 'customer'])
